@@ -13,7 +13,13 @@ from fastapi.responses import JSONResponse
 
 from . import db as dbmod
 from .errors import ApiError
-from .schemas import ConsumeRequest, RegisterTubeRequest, SplitRequest
+from .schemas import (
+    ConsumeRequest,
+    QuarantineRequest,
+    RegisterTubeRequest,
+    ReleaseQuarantineRequest,
+    SplitRequest,
+)
 
 
 def _utcnow() -> str:
@@ -32,6 +38,82 @@ def _tube_view(row: sqlite3.Row) -> dict:
         "initial_ul": row["initial_ul"],
         "created_at": row["created_at"],
     }
+
+
+def _quarantine_record(row: sqlite3.Row) -> dict:
+    return {
+        "quarantine_id": row["id"],
+        "tube_id": row["tube_id"],
+        "reason": row["reason"],
+        "operator_id": row["operator_id"],
+        "created_at": row["created_at"],
+        "released_at": row["released_at"],
+        "released_by": row["released_by"],
+        "release_note": row["release_note"],
+    }
+
+
+# Active quarantine records effectively holding a tube: its own active records
+# and every active record of its ancestors. The recursive walk starts at the
+# tube and follows lineage edges up to the root; bfs keeps ancestors at smaller
+# depths first, so the final ORDER BY root_depth (root first) then record id
+# yields reasons in root -> leaf order. A released record (released_at IS NOT
+# NULL) drops out everywhere, so releasing one row never lifts a sibling hold.
+_EFFECTIVE_QUARANTINE_SQL = """
+WITH RECURSIVE chain(id, depth) AS (
+    SELECT ?, 0
+    UNION ALL
+    SELECT e.parent_id, c.depth + 1
+      FROM lineage_edges e
+      JOIN chain c ON e.child_id = c.id
+)
+SELECT q.*
+  FROM quarantine_records q
+  JOIN chain c ON q.tube_id = c.id
+ WHERE q.released_at IS NULL
+ ORDER BY c.depth DESC, q.id
+"""
+
+
+def _effective_quarantine(conn: sqlite3.Connection, tube_id: str) -> list[dict]:
+    rows = conn.execute(_EFFECTIVE_QUARANTINE_SQL, (tube_id,)).fetchall()
+    return [_quarantine_record(r) for r in rows]
+
+
+def _direct_quarantine(conn: sqlite3.Connection, tube_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM quarantine_records WHERE tube_id = ? AND released_at IS NULL "
+        "ORDER BY id",
+        (tube_id,),
+    ).fetchall()
+    return [_quarantine_record(r) for r in rows]
+
+
+def _quarantine_status(conn: sqlite3.Connection, tube_id: str) -> dict:
+    direct = _direct_quarantine(conn, tube_id)
+    effective = _effective_quarantine(conn, tube_id)
+    return {
+        "is_quarantined": bool(effective),
+        "direct": direct,
+        "effective": effective,
+    }
+
+
+def _ensure_not_quarantined(conn: sqlite3.Connection, tube_id: str, action: str) -> None:
+    """Reject a split/consumption on any tube still held by its own or an
+    ancestor's active quarantine record. Must run inside the write transaction
+    that would perform the change, so the decision and the commit are atomic —
+    no check-then-commit gap."""
+    effective = _effective_quarantine(conn, tube_id)
+    if effective:
+        raise ApiError(
+            423,
+            "TUBE_QUARANTINED",
+            f"tube {tube_id!r} is quarantined and cannot {action} until every "
+            f"effective quarantine record is released",
+            details={"effective_quarantine": effective},
+        )
+
 
 
 def _consumption_record(row: sqlite3.Row) -> dict:
@@ -78,9 +160,12 @@ def create_app(db_path: str) -> FastAPI:
 
     @app.exception_handler(ApiError)
     async def api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
+        error = {"code": exc.code, "message": exc.message}
+        if exc.details:
+            error.update(exc.details)
         return JSONResponse(
             status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content={"error": error},
         )
 
     @app.exception_handler(RequestValidationError)
@@ -135,14 +220,30 @@ def create_app(db_path: str) -> FastAPI:
 
     @app.get("/tubes/{tube_id}")
     def get_tube(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
-        row = conn.execute("SELECT * FROM tubes WHERE id = ?", (tube_id,)).fetchone()
-        if row is None:
-            raise ApiError(404, "TUBE_NOT_FOUND", f"tube {tube_id!r} does not exist")
-        view = _tube_view(row)
-        edge = conn.execute(
-            "SELECT parent_id FROM lineage_edges WHERE child_id = ?", (tube_id,)
-        ).fetchone()
-        view["parent_id"] = edge["parent_id"] if edge else None
+        # Tube state, parent edge and quarantine facts are read in one snapshot
+        # transaction, so the reported effective quarantine can never be stitched
+        # from a release that landed between two statements. Read-only: in WAL
+        # mode this never blocks a concurrent writer.
+        conn.execute("BEGIN")
+        try:
+            row = conn.execute("SELECT * FROM tubes WHERE id = ?", (tube_id,)).fetchone()
+            if row is None:
+                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {tube_id!r} does not exist")
+            view = _tube_view(row)
+            edge = conn.execute(
+                "SELECT parent_id FROM lineage_edges WHERE child_id = ?", (tube_id,)
+            ).fetchone()
+            view["parent_id"] = edge["parent_id"] if edge else None
+            # Direct records on this tube and the effective set (its own plus
+            # ancestors', root -> leaf order) that currently hold it.
+            view["quarantine"] = _quarantine_status(conn, tube_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        conn.execute("COMMIT")
         return view
 
     @app.get("/tubes/{tube_id}/ancestry")
@@ -178,11 +279,23 @@ def create_app(db_path: str) -> FastAPI:
                         "amount_ul": edge["amount_ul"],
                         "split": _split_record(conn, split_row),
                     }
-                chain.append({"tube": _tube_view(row), "via": via})
+                chain.append(
+                    {
+                        "tube": _tube_view(row),
+                        "via": via,
+                        # Records placed directly on this chain tube. The
+                        # history edges above are untouched; quarantine facts
+                        # are presented alongside them, not merged into them.
+                        "direct_quarantine": _direct_quarantine(conn, current_id),
+                    }
+                )
                 if edge is None:
                     break
                 current_id = edge["parent_id"]
             chain.reverse()
+            # Effective reasons holding the queried tube, root -> leaf order,
+            # from the same snapshot as the chain itself.
+            effective_quarantine = _effective_quarantine(conn, tube_id)
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -190,7 +303,13 @@ def create_app(db_path: str) -> FastAPI:
                 pass
             raise
         conn.execute("COMMIT")
-        return {"tube_id": tube_id, "depth": len(chain) - 1, "chain": chain}
+        return {
+            "tube_id": tube_id,
+            "depth": len(chain) - 1,
+            "chain": chain,
+            "is_quarantined": bool(effective_quarantine),
+            "effective_quarantine": effective_quarantine,
+        }
 
     @app.get("/tubes/{tube_id}/splits")
     def get_tube_splits(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
@@ -297,6 +416,10 @@ def create_app(db_path: str) -> FastAPI:
             ).fetchone()
             if parent is None:
                 raise ApiError(404, "PARENT_NOT_FOUND", f"parent tube {req.parent_id!r} does not exist")
+            # The hold is adjudicated inside this same write transaction — no
+            # read-then-commit window in which a quarantine could land. A parent
+            # held by its own record or by any ancestor's record cannot dispense.
+            _ensure_not_quarantined(conn, req.parent_id, "be split")
             if parent["revision"] != req.expected_revision:
                 raise ApiError(
                     412,
@@ -419,6 +542,9 @@ def create_app(db_path: str) -> FastAPI:
             ).fetchone()
             if tube is None:
                 raise ApiError(404, "TUBE_NOT_FOUND", f"tube {req.tube_id!r} does not exist")
+            # Adjudicated inside the write transaction: a tube held by its own
+            # record or by an ancestor's record cannot be consumed from.
+            _ensure_not_quarantined(conn, req.tube_id, "be consumed")
             if tube["revision"] != req.expected_revision:
                 raise ApiError(
                     412,
@@ -481,6 +607,93 @@ def create_app(db_path: str) -> FastAPI:
             except sqlite3.Error:
                 pass
             raise
+
+    # ----------------------------------------------------------- quarantine
+
+    @app.post("/quarantines", status_code=201)
+    def quarantine_tube(req: QuarantineRequest, conn: sqlite3.Connection = Depends(get_db)):
+        # Quarantine itself is a write transaction: the target must exist and the
+        # audit row must be durable together. It never touches balances, lineage
+        # edges, consumption vouchers or initial_ul, so conservation results are
+        # unchanged by placing or releasing holds.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            target = conn.execute(
+                "SELECT id FROM tubes WHERE id = ?", (req.tube_id,)
+            ).fetchone()
+            if target is None:
+                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {req.tube_id!r} does not exist")
+            now = _utcnow()
+            cur = conn.execute(
+                "INSERT INTO quarantine_records (tube_id, reason, operator_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (req.tube_id, req.reason, req.operator_id, now),
+            )
+            record_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT * FROM quarantine_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            record = _quarantine_record(row)
+            effective = _effective_quarantine(conn, req.tube_id)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return {**record, "is_quarantined": True, "effective_quarantine": effective}
+
+    @app.post("/quarantine-records/{record_id}/release")
+    def release_quarantine(record_id: int, req: ReleaseQuarantineRequest,
+                           conn: sqlite3.Connection = Depends(get_db)):
+        # Release exactly one record. It is adjudicated and committed in one
+        # write transaction: an already-released record is a 409, and the UPDATE
+        # is conditional on released_at IS NULL so two concurrent releases can
+        # never both succeed. Nothing else — sibling records on the same tube or
+        # ancestor records — is modified.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM quarantine_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                raise ApiError(
+                    404,
+                    "QUARANTINE_RECORD_NOT_FOUND",
+                    f"quarantine record {record_id} does not exist",
+                )
+            if row["released_at"] is not None:
+                raise ApiError(
+                    409,
+                    "QUARANTINE_ALREADY_RELEASED",
+                    f"quarantine record {record_id} was already released at {row['released_at']}",
+                )
+            now = _utcnow()
+            cur = conn.execute(
+                "UPDATE quarantine_records SET released_at = ?, released_by = ?, release_note = ? "
+                "WHERE id = ? AND released_at IS NULL",
+                (now, req.operator_id, req.note, record_id),
+            )
+            if cur.rowcount != 1:  # defence in depth against a concurrent release
+                raise ApiError(
+                    409,
+                    "QUARANTINE_ALREADY_RELEASED",
+                    f"quarantine record {record_id} was already released",
+                )
+            updated = conn.execute(
+                "SELECT * FROM quarantine_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            record = _quarantine_record(updated)
+            effective = _effective_quarantine(conn, record["tube_id"])
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return {**record, "is_quarantined": bool(effective), "effective_quarantine": effective}
 
     return app
 

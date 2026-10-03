@@ -9,6 +9,10 @@ from pathlib import Path
 # splits / split_children / lineage_edges / consumptions are *history*:
 # insert-only, enforced by triggers below so no code path (or manual SQL) can
 # rewrite the past.
+# quarantine_records are *audit facts about a tube*: insert-only, and the only
+# mutation ever permitted is releasing a record once (released_at NULL -> set).
+# A tube's effective quarantine is its own active records plus every active
+# record of its ancestors; releasing one record never touches any other.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tubes (
     id          TEXT PRIMARY KEY,
@@ -72,6 +76,45 @@ CREATE TABLE IF NOT EXISTS consumption_keys (
     consumption_id INTEGER NOT NULL REFERENCES consumptions (id),
     created_at     TEXT NOT NULL
 );
+
+-- Quarantine holds a tube (and therefore all of its existing descendants) out
+-- of splitting and consumption pending review. Each row is one record with its
+-- own reason/operator. A target is effectively quarantined while *any* record
+-- on itself or on an ancestor (following lineage_edges) is still active
+-- (released_at IS NULL). Releasing one record flips its own row only; it never
+-- releases sibling records on the same tube or records higher up the chain.
+CREATE TABLE IF NOT EXISTS quarantine_records (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    tube_id              TEXT NOT NULL REFERENCES tubes (id),
+    reason               TEXT NOT NULL CHECK (length(reason) > 0),
+    operator_id          TEXT NOT NULL CHECK (length(operator_id) > 0),
+    created_at           TEXT NOT NULL,
+    released_at          TEXT,
+    released_by          TEXT,
+    release_note         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_tube ON quarantine_records (tube_id);
+
+CREATE TRIGGER IF NOT EXISTS quarantine_records_no_delete
+BEFORE DELETE ON quarantine_records
+BEGIN SELECT RAISE(ABORT, 'quarantine records cannot be deleted'); END;
+
+-- Records are immutable apart from the single null -> set release transition.
+-- Quarantine facts (target, reason, operator, creation time) can never be
+-- rewritten, and a released record cannot be re-opened.
+CREATE TRIGGER IF NOT EXISTS quarantine_records_no_rewrite
+BEFORE UPDATE ON quarantine_records
+WHEN EXISTS (
+        SELECT 1 FROM quarantine_records q
+        WHERE q.id = NEW.id
+          AND (q.tube_id <> NEW.tube_id
+               OR q.reason <> NEW.reason
+               OR q.operator_id <> NEW.operator_id
+               OR q.created_at <> NEW.created_at)
+     )
+  OR OLD.released_at IS NOT NULL
+  OR NEW.released_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'quarantine records may only be released once'); END;
 
 CREATE TRIGGER IF NOT EXISTS splits_no_update
 BEFORE UPDATE ON splits
