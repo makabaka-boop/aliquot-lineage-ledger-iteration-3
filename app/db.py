@@ -6,9 +6,9 @@ from pathlib import Path
 # tubes holds *current state* (balance, revision) and is mutable — except
 # initial_ul, which is written once (at registration, at split-child creation,
 # or by the one-time upgrade backfill) and then frozen by trigger.
-# splits / split_children / lineage_edges / consumptions are *history*:
-# insert-only, enforced by triggers below so no code path (or manual SQL) can
-# rewrite the past.
+# splits / split_children / lineage_edges / consumptions / quarantines /
+# quarantine_releases are *history*: insert-only, enforced by triggers below
+# so no code path (or manual SQL) can rewrite the past.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tubes (
     id          TEXT PRIMARY KEY,
@@ -73,6 +73,29 @@ CREATE TABLE IF NOT EXISTS consumption_keys (
     created_at     TEXT NOT NULL
 );
 
+-- Quarantine filings are facts too: each record parks one tube (and, in
+-- effect, its descendants) and stores reason / operator / target. A tube's
+-- effective quarantine state is derived from the still-unreleased records on
+-- itself and its ancestors — never stored on the tube row, so balances,
+-- revisions and the lineage ledger are untouched by quarantine activity.
+CREATE TABLE IF NOT EXISTS quarantines (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tube_id     TEXT NOT NULL REFERENCES tubes (id),
+    reason      TEXT NOT NULL CHECK (length(reason) > 0),
+    operator    TEXT NOT NULL CHECK (length(operator) > 0),
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quarantines_tube ON quarantines (tube_id);
+
+-- A release lifts exactly one record (UNIQUE enforces at most one release per
+-- record); other records on the same tube or its ancestors stay in effect.
+CREATE TABLE IF NOT EXISTS quarantine_releases (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    quarantine_id  INTEGER NOT NULL UNIQUE REFERENCES quarantines (id),
+    operator       TEXT NOT NULL CHECK (length(operator) > 0),
+    created_at     TEXT NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS splits_no_update
 BEFORE UPDATE ON splits
 BEGIN SELECT RAISE(ABORT, 'splits history is immutable'); END;
@@ -104,6 +127,22 @@ BEGIN SELECT RAISE(ABORT, 'consumption history is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS consumptions_no_delete
 BEFORE DELETE ON consumptions
 BEGIN SELECT RAISE(ABORT, 'consumption history is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS quarantines_no_update
+BEFORE UPDATE ON quarantines
+BEGIN SELECT RAISE(ABORT, 'quarantine history is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS quarantines_no_delete
+BEFORE DELETE ON quarantines
+BEGIN SELECT RAISE(ABORT, 'quarantine history is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS quarantine_releases_no_update
+BEFORE UPDATE ON quarantine_releases
+BEGIN SELECT RAISE(ABORT, 'quarantine release history is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS quarantine_releases_no_delete
+BEFORE DELETE ON quarantine_releases
+BEGIN SELECT RAISE(ABORT, 'quarantine release history is immutable'); END;
 """
 
 # initial_ul is frozen once set. The trigger is installed separately, only

@@ -60,3 +60,42 @@ class ConsumeRequest(BaseModel):
         if not v.strip():
             raise ValueError("purpose must be non-empty")
         return v
+
+
+def _check_not_blank(v: str, field: str) -> str:
+    if not v.strip():
+        raise ValueError(f"{field} must be non-empty")
+    return v
+
+
+class QuarantineRequest(BaseModel):
+    """File a quarantine record against one tube: parks it and, in effect,
+    every existing descendant, until this record is released."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=1, max_length=512)]
+    operator: Annotated[str, Field(min_length=1, max_length=128)]
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        return _check_not_blank(v, "reason")
+
+    @field_validator("operator")
+    @classmethod
+    def _operator_not_blank(cls, v: str) -> str:
+        return _check_not_blank(v, "operator")
+
+
+class ReleaseRequest(BaseModel):
+    """Lift exactly one quarantine record; other records stay in effect."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operator: Annotated[str, Field(min_length=1, max_length=128)]
+
+    @field_validator("operator")
+    @classmethod
+    def _operator_not_blank(cls, v: str) -> str:
+        return _check_not_blank(v, "operator")
