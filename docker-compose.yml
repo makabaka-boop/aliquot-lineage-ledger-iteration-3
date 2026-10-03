@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: sample-split-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/lab.db
+    volumes:
+      - sample-data:/data
+    restart: unless-stopped
+
+volumes:
+  sample-data:

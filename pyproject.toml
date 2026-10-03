@@ -1,0 +1,9 @@
+[project]
+name = "sample-split-service"
+version = "1.0.0"
+description = "Traceable sample tube splitting inventory (FastAPI + SQLite)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
